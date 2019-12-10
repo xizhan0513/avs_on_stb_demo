@@ -27,17 +27,11 @@ app.config.update({
 # 创建数据库ORM
 db = SQLAlchemy(app)
 
-
-# 存储oauth认证服务器用户信息的ORM
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    clientname = db.Column(db.String(40), unique=True)
-
-
 # 存储资源服务器用户名、密码、设备信息
 class Resources(db.Model):
     __tablename__ = 'Resources'
-    username = db.Column(db.String(20), primary_key=True)
+    user_id  = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(20))
     password = db.Column(db.String(20))
     dev_id   = db.Column(db.String(100))
     stb_num  = db.Column(db.String(100))
@@ -45,57 +39,25 @@ class Resources(db.Model):
 
 # 存储oauth客户端信息的ORM
 class Client(db.Model):
-    client_id = db.Column(db.String(40), primary_key=True)
+    user_id       = db.Column(db.Integer, primary_key=True)
+    client_name   = db.Column(db.String(40))
+    client_id     = db.Column(db.String(40), nullable=False)
     client_secret = db.Column(db.String(55), nullable=False)
-
-    user_id = db.Column(db.ForeignKey('user.id'))
-    user = db.relationship('User')
-
     _redirect_uris = db.Column(db.Text)
-    _default_scopes = db.Column(db.Text)
-
-    @property
-    def client_type(self):
-        return 'public'
-
-    @property
-    def redirect_uris(self):
-        if self._redirect_uris:
-            return self._redirect_uris.split()
-        return []
-
-    @property
-    def default_redirect_uri(self):
-        return self.redirect_uris[0]
-
-    @property
-    def default_scopes(self):
-        if self._default_scopes:
-            return self._default_scopes.split()
-        return []
 
 
 # 存储授权码信息的ORM
 class Grant(db.Model):
     id = db.Column(db.Integer, primary_key=True)
 
-    user_id = db.Column(
-        db.Integer, db.ForeignKey('user.id', ondelete='CASCADE')
-    )
-    user = db.relationship('User')
-
     client_id = db.Column(
         db.String(40), db.ForeignKey('client.client_id'),
         nullable=False,
     )
-    client = db.relationship('Client')
 
     code = db.Column(db.String(255), index=True, nullable=False)
-
     redirect_uri = db.Column(db.String(255))
     expires = db.Column(db.DateTime)
-
-    _scopes = db.Column(db.Text)
 
     resources_username = db.Column(
         db.String(20), db.ForeignKey('Resources.username'),
@@ -107,12 +69,6 @@ class Grant(db.Model):
         db.session.commit()
         return self
 
-    @property
-    def scopes(self):
-        if self._scopes:
-            return self._scopes.split()
-        return []
-
 
 # 存储token信息的ORM
 class Token(db.Model):
@@ -121,12 +77,6 @@ class Token(db.Model):
         db.String(40), db.ForeignKey('client.client_id'),
         nullable=False,
     )
-    client = db.relationship('Client')
-
-    user_id = db.Column(
-        db.Integer, db.ForeignKey('user.id')
-    )
-    user = db.relationship('User')
 
     # currently only bearer is supported
     token_type = db.Column(db.String(40))
@@ -134,25 +84,62 @@ class Token(db.Model):
     access_token = db.Column(db.String(255), unique=True)
     refresh_token = db.Column(db.String(255), unique=True)
     expires = db.Column(db.DateTime)
-    _scopes = db.Column(db.Text)
 
     resources_username = db.Column(
         db.String(20), db.ForeignKey('Resources.username'),
         nullable=False,
     )
 
-    @property
-    def scopes(self):
-        if self._scopes:
-            return self._scopes.split()
-        return []
+
+def load_client(client_id):
+    return Client.query.filter_by(client_id=client_id).first()
 
 
-def current_user():
-    if 'id' in session:
-        uid = session['id']
-        return User.query.get(uid)
-    return None
+def load_grant(client_id, code):
+    return Grant.query.filter_by(client_id=client_id, code=code).first()
+
+
+def save_grant(args_client_id, args_code, args_redirect_uri):
+    # decide the expires time yourself
+    expires = datetime.utcnow() + timedelta(seconds=600)
+    grant = Grant(
+        client_id    = args_client_id,
+        code         = args_code,
+        redirect_uri = args_redirect_uri,
+        expires      = expires,
+        resources_username     = session['login_user']
+    )
+    db.session.add(grant)
+    db.session.commit()
+
+
+def load_token(access_token=None, refresh_token=None):
+    if access_token:
+        return Token.query.filter_by(access_token=access_token).first()
+    elif refresh_token:
+        return Token.query.filter_by(refresh_token=refresh_token).first()
+
+
+def save_token(args_access_token, args_refresh_token, args_token_type, args_client, username):
+    toks = Token.query.filter_by(
+        client_id = args_client.client_id,
+    )
+    # make sure that every client has only one token connected to a user
+    for t in toks:
+        db.session.delete(t)
+
+    expires = datetime.utcnow() + timedelta(seconds=24*60*60)
+
+    tok = Token(
+        access_token  = args_access_token,
+        refresh_token = args_refresh_token,
+        token_type    = args_token_type,
+        expires       = expires,
+        client_id     = args_client.client_id,
+        resources_username  = username
+    )
+    db.session.add(tok)
+    db.session.commit()
 
 
 # 注册客户端用户
@@ -160,15 +147,52 @@ def current_user():
 def home():
     if request.method == 'POST':
         clientname = request.form.get('clientname')
-        user = User.query.filter_by(clientname=clientname).first()
-        if not user:
-            user = User(clientname=clientname)
-            db.session.add(user)
+        client = Client.query.filter_by(client_name=clientname).first()
+        valid_user = True
+        if client == None:
+            valid_user = False
+        params = {
+            'valid_user': valid_user,
+            'clientname': clientname,
+        }
+        url = furl('/client').set(params)
+        return redirect(url)
+
+    return render_template('home.html')
+
+
+# 注册一个新的oauth客户端
+@app.route('/client', methods=['GET', 'POST'])
+def client():
+    if request.method == 'GET':
+        clientname = request.args.get('clientname')
+        if not clientname:
+            return redirect('/')
+
+        valid = request.args.get('valid_user')
+        if valid == 'True':
+            client = Client.query.filter_by(client_name=clientname).first()
+            return jsonify(
+                client_id     = client.client_id,
+                client_secret = client.client_secret,
+            )
+        else:
+            client = Client(
+                client_name   = clientname,
+                client_id     = gen_salt(40),
+                client_secret = gen_salt(50),
+                _redirect_uris=' '.join([
+                    'https://pitangui.amazon.com/api/skill/link/M1YD9F7ZN5PH0C',
+                    ]),
+            )
+
+            db.session.add(client)
             db.session.commit()
-        session['id'] = user.id
-        return redirect('/client')
-    user = current_user()
-    return render_template('home.html', user=user)
+
+            return jsonify(
+                client_id     = client.client_id,
+                client_secret = client.client_secret,
+            )
 
 
 # 登录界面
@@ -177,7 +201,6 @@ def login():
     if request.method == 'GET':
         args = {}
         args['client_id']     = request.args.get('client_id')
-        args['scope']         = request.args.get('scope')
         args['state']         = request.args.get('state')
         args['response_type'] = request.args.get('response_type')
         args['redirect_uri']  = request.args.get('redirect_uri')
@@ -198,97 +221,67 @@ def login():
         url = '/oauth/authorize'
         params = {
             'client_id': request.form.get('client_id'),
-            'scope': request.form.get('scope'),
+            'state': request.form.get('state'),
             'response_type': request.form.get('response_type'),
             'redirect_uri': request.form.get('redirect_uri'),
-            'state': request.form.get('state'),
         }
         url = furl(url).set(params)
         session['login'] = True
         session['login_user'] = res_user.username
-        return redirect(url, 302)
+        return redirect(url)
 
 
-# 注册一个新的oauth客户端
-@app.route('/client')
-def client():
-    user = current_user()
+# Authorization URI
+@app.route('/oauth/authorize', methods=['GET', 'POST'])
+def authorize():
+    if request.method == 'GET':
+        if 'login' in session and session['login'] == True:
+            session['login'] == False
+        else:
+            url = '/login'
+            params = {
+                'client_id': request.args.get('client_id'),
+                'state': request.args.get('state'),
+                'response_type': request.args.get('response_type'),
+                'redirect_uri': request.args.get('redirect_uri'),
+            }
+            url = furl(url).set(params)
+            return redirect(url)
 
-    if not user:
-        return redirect('/')
+    if request.method == 'GET':
+        args = {}
+        client_id = request.args.get('client_id')
+        client = Client.query.filter_by(client_id=client_id).first()
+        if client == None:
+            params = {
+                'status': 'Client account is NULL!'
+            }
+            url = furl(request.args.get('redirect_uri')).set(params)
+            return redirect(url)
 
-    item = Client(
-        client_id=gen_salt(40),
-        client_secret=gen_salt(50),
-        _redirect_uris=' '.join([
-            'https://pitangui.amazon.com/api/skill/link/M1YD9F7ZN5PH0C',
-            ]),
-        _default_scopes='email',
-        user_id=user.id,
-    )
-    db.session.add(item)
-    db.session.commit()
+        args['client_id']    = client_id
+        args['clientname']   = client.client_name
+        args['redirect_uri'] = request.args.get('redirect_uri')
+        args['state']        = request.args.get('state')
+        return render_template('authorize.html', **args)
 
-    return jsonify(
-        client_id=item.client_id,
-        client_secret=item.client_secret,
-    )
+    confirm = request.form.get('confirm', 'no')
+    if confirm == 'yes':
+        client_id    = request.form.get('client_id')
+        code         = gen_salt(255)
+        redirect_uri = request.form.get('redirect_uri')
+        state        = request.form.get('state')
+        save_grant(client_id, code, redirect_uri)
 
+        params = {
+            'code': code,
+            'state': state
+        }
+        url = furl(redirect_uri).set(params)
+        return redirect(url)
 
-def load_client(client_id):
-    return Client.query.filter_by(client_id=client_id).first()
-
-
-def load_grant(client_id, code):
-    return Grant.query.filter_by(client_id=client_id, code=code).first()
-
-
-def save_grant(args_client_id, args_code, args_redirect_uri, args_scopes):
-    # decide the expires time yourself
-    expires = datetime.utcnow() + timedelta(seconds=600)
-    grant = Grant(
-        client_id    = args_client_id,
-        code         = args_code,
-        redirect_uri = args_redirect_uri,
-        _scopes      = ''.join(args_scopes),
-        user         = current_user(),
-        expires      = expires,
-        resources_username     = session['login_user']
-    )
-    db.session.add(grant)
-    db.session.commit()
-
-
-def load_token(access_token=None, refresh_token=None):
-    if access_token:
-        return Token.query.filter_by(access_token=access_token).first()
-    elif refresh_token:
-        return Token.query.filter_by(refresh_token=refresh_token).first()
-
-
-def save_token(args_access_token, args_refresh_token, args_token_type, args_client, username):
-    toks = Token.query.filter_by(
-        client_id = args_client.client_id,
-        user_id   = args_client.user_id
-    )
-    # make sure that every client has only one token connected to a user
-    for t in toks:
-        db.session.delete(t)
-
-    expires = datetime.utcnow() + timedelta(seconds=24*60*60)
-
-    tok = Token(
-        access_token  = args_access_token,
-        refresh_token = args_refresh_token,
-        token_type    = args_token_type,
-        _scopes       = args_client._default_scopes,
-        expires       = expires,
-        client_id     = args_client.client_id,
-        user_id       = args_client.user_id,
-        resources_username  = username
-    )
-    db.session.add(tok)
-    db.session.commit()
+    elif confirm == 'no':
+        return 'User refuses authorization!'
 
 
 # Access Token URI
@@ -296,7 +289,7 @@ def save_token(args_access_token, args_refresh_token, args_token_type, args_clie
 def access_token():
     if request.method == 'POST':
         data = request.form.to_dict()
-        client        = load_client(data['client_id'])
+        client = load_client(data['client_id'])
         if client == None:
             payload = {
                 'status': 'Client account is NULL!'
@@ -304,7 +297,6 @@ def access_token():
             return json.dumps(payload)
 
         grant = load_grant(data['client_id'], data['code'])
-
         if grant == None:
             payload = {
                 'status': 'code error!'
@@ -323,63 +315,6 @@ def access_token():
         }
 
         return json.dumps(payload)
-
-
-# Authorization URI
-@app.route('/oauth/authorize', methods=['GET', 'POST'])
-def authorize():
-    print("------------##----------------")
-    if request.method == 'GET':
-        if 'login' in session and session['login'] == True:
-            session['login'] == False
-        else:
-            url = '/login'
-            params = {
-                'client_id': request.args.get('client_id'),
-                'scope': request.args.get('scope'),
-                'response_type': request.args.get('response_type'),
-                'redirect_uri': request.args.get('redirect_uri'),
-                'state': request.args.get('state'),
-            }
-            url = furl(url).set(params)
-            return redirect(url, 302)
-
-    if request.method == 'GET':
-        args = {}
-        client_id = request.args.get('client_id')
-        client = Client.query.filter_by(client_id=client_id).first()
-        if client == None:
-            params = {
-                'status': 'Client account is NULL!'
-            }
-            url = furl(request.args.get('redirect_uri')).set(params)
-            return redirect(url, 302)
-
-        args['client']       = client
-        args['user']         = User.query.filter_by(id=client.user_id).first()
-        args['scopes']       = request.args.get('scope')
-        args['redirect_uri'] = request.args.get('redirect_uri')
-        args['state']        = request.args.get('state')
-        return render_template('authorize.html', **args)
-
-    confirm = request.form.get('confirm', 'no')
-    if confirm == 'yes':
-        client_id    = request.form.get('client_id')
-        code         = gen_salt(255)
-        redirect_uri = request.form.get('redirect_uri')
-        scopes       = request.form.get('scope')
-        state        = request.form.get('state')
-        save_grant(client_id, code, redirect_uri, scopes)
-
-        params = {
-            'code': code,
-            'state': state
-        }
-        url = furl(redirect_uri).set(params)
-        return redirect(url, 302)
-
-    elif confirm == 'no':
-        return 'User refuses authorization!'
 
 
 # 资源服务器
@@ -418,9 +353,31 @@ def api_me():
     return 'api end'
 
 
+def init_resources_db():
+    res = Resources.query.filter_by(username='xizhan1').first()
+    if res == None:
+        res1 = Resources(
+            username = 'xizhan1',
+            password = '123456',
+            dev_id   = '1,2,3',
+            stb_num  = '100001,100002,100003',
+        )
+        db.session.add(res1)
+
+        res2 = Resources(
+            username = 'xizhan2',
+            password = '123456',
+            dev_id   = '1,2,3',
+            stb_num  = '100004,100005,100006',
+        )
+        db.session.add(res2)
+        db.session.commit()
+
+
 if __name__ == '__main__':
     import os
     db.create_all()
+    init_resources_db()
     os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = 'true'
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=5000)
 
