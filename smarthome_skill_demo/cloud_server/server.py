@@ -362,7 +362,7 @@ def init_resources_db():
         res1 = Resources(
             username = 'xizhan1',
             password = '123456',
-            dev_id   = '1,2,3',
+            dev_id   = 'living room TV,bedroom TV,upstairs TV',
             stb_num  = '100001,100002,100003',
         )
         db.session.add(res1)
@@ -370,7 +370,7 @@ def init_resources_db():
         res2 = Resources(
             username = 'xizhan2',
             password = '123456',
-            dev_id   = '1,2,3',
+            dev_id   = 'living room TV,bedroom TV,upstairs TV',
             stb_num  = '100004,100005,100006',
         )
         db.session.add(res2)
